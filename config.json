@@ -1,0 +1,22 @@
+{
+    
+  "search": {
+    "keywords": ["手写笔记", "无纸化"],
+    "sort_type": "latest",
+    "filter_date": ""
+  },
+  "execution": {
+    "max_count_total": 999999,
+    "interval_range": [10, 20],
+    "auto_like": true,
+    "max_comments_per_round": 10,
+    "round_interval": 60,
+    "retry_interval": 10
+  },
+  "comment_mode": {
+    "mode": "fixed",
+    "fixed_content": [
+      "手写笔记转电子 点我主页白菜价 图片pdf上百mb 一键转换几百kb 论文级排版 理工公式精准转换 老教材翻新 不再看马赛克书籍"
+    ]
+  }
+}

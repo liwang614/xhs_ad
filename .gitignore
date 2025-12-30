@@ -2,7 +2,7 @@
 __pycache__/
 *.pyc
 data/cookies.json
-config.json
+
 *.db
 *.log
 
