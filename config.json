@@ -1,5 +1,4 @@
 {
-    
   "search": {
     "keywords": ["手写笔记", "无纸化"],
     "sort_type": "latest",
@@ -8,15 +7,33 @@
   "execution": {
     "max_count_total": 999999,
     "interval_range": [10, 20],
-    "auto_like": true,
     "max_comments_per_round": 10,
-    "round_interval": 60,
-    "retry_interval": 10
+    "round_interval": 60
   },
   "comment_mode": {
     "mode": "fixed",
     "fixed_content": [
       "手写笔记转电子 点我主页白菜价 图片pdf上百mb 一键转换几百kb 论文级排版 理工公式精准转换 老教材翻新 不再看马赛克书籍"
     ]
+  },
+  "ai_judge": {
+    "mode": "manual",
+    "provider": "gemini",
+    "judge_model": "gemini-3-flash-preview",
+    "generate_model": "gemini-3-flash-preview",
+    "generate_prompt_template": "你是小红书评论助手。请基于以下内容写一条自然、礼貌、简洁的中文回复，不要输出解释。\n标题：{{title}}\n内容：{{content}}\n只输出回复文案。",
+    "generate_reply_mode": "manual",
+    "reply_target_ids": [],
+    "overwrite_generated_comment": false,
+    "batch_size": 50,
+    "timeout": 30,
+    "base_url": "",
+    "tables": ["xhs_note_comment"],
+    "note_prompt_template": "判断这条内容是否适合进行“手写笔记电子化”广告推销。\n有明确需求或求助（如无纸化、手写转电子、OCR、PDF整理、笔记数字化）返回1；不需要或不相关返回0。\n标题：{{title}}\n内容：{{content}}\n只输出 JSON：{\"is_help_post\": 0 或 1}",
+    "comment_prompt_template": "判断这条评论是否适合进行“手写笔记电子化”广告推销。\n有明确需求或求助返回1；不需要或不相关返回0。\n评论：{{content}}\n只输出 JSON：{\"is_help_post\": 0 或 1}"
+  },
+  "mcp": {
+    "url": "http://127.0.0.1:18060/mcp",
+    "reply_tool_name": "reply_comment_in_feed"
   }
 }

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import random
 import time
-from datetime import datetime
 
-from modules.config_loader import COLOR_GREEN, COLOR_RED, COLOR_YELLOW, load_config, print_colored
-from modules.history_store import HistoryStore, InteractionRecord
+from modules.config_loader import COLOR_GREEN, COLOR_YELLOW, load_config, print_colored
+from modules.database_store import DatabaseStore, InteractionRecord
+from modules.help_post_judge import AIHelpPostJudge, HelpPostJudgeError
 from modules.logic_processor import ACTION_QUIT, ACTION_SKIP, LogicProcessor
-from modules.xhs_service import McpError, XhsService
+from tools.classify_help_posts import run_batch_classify_help_posts
+from tools.generate_and_reply_help_comments import run_generate_and_reply_help_comments
 
 
 def main() -> int:
@@ -18,168 +19,211 @@ def main() -> int:
         print_colored(f"[警告] 配置加载失败：{exc}", COLOR_YELLOW)
         return 1
     print_colored("配置加载完成", COLOR_GREEN)
-    if not config.search.keywords:
+    if not config.search.keywords and config.ai_judge.generate_reply_mode == "manual":
         print_colored("[警告] 未配置关键词，程序退出", COLOR_YELLOW)
         return 1
 
     processed = 0
     skipped = 0
     failed = 0
+    help_judged = 0
+    help_judge_failed = 0
+    generated_success = 0
+    generated_failed = 0
+    replied_success = 0
+    replied_failed = 0
 
-    print("正在检查登录状态...")
-    with XhsService() as service:
+    judge: AIHelpPostJudge | None = None
+    if config.ai_judge.mode != "manual":
         try:
-            authed = service.check_auth()
-        except McpError as exc:
-            print_colored(f"[错误] 登录检查失败：{exc}", COLOR_RED)
-            return 1
-        if not authed:
-            print_colored("未登录，请先扫码登录后再运行。", COLOR_RED)
-            return 1
-        print_colored("已登录", COLOR_GREEN)
+            judge = AIHelpPostJudge(
+                provider=config.ai_judge.provider,
+                model=config.ai_judge.judge_model,
+                base_url=config.ai_judge.base_url,
+                timeout=config.ai_judge.timeout,
+                note_prompt_template=config.ai_judge.note_prompt_template,
+                comment_prompt_template=config.ai_judge.comment_prompt_template,
+            )
+            print(
+                "AI判定已启用："
+                f"mode={config.ai_judge.mode}, provider={config.ai_judge.provider}, model={config.ai_judge.judge_model}"
+            )
+        except HelpPostJudgeError as exc:
+            print_colored(f"[警告] AI判定初始化失败，已降级为不判定：{exc}", COLOR_YELLOW)
+            judge = None
 
-        print("正在连接数据库...")
-        with HistoryStore() as store:
-            total = store.count_all()
-            print(f"数据库连接成功，历史记录 {total} 条")
+    print("正在连接数据库...")
+    with DatabaseStore() as store:
+        total = store.count_all_interactions()
+        print(f"数据库连接成功，历史记录 {total} 条")
 
-            processor = LogicProcessor(service, store, config)
-            should_quit = False
+        processor = LogicProcessor(config)
+        should_quit = False
+        round_count = 1
 
-            round_count = 1
-            while True:
-                print(f"\n================ 第 {round_count} 轮开始 ================")
-                processed_in_round = 0
-                should_quit = False
+        while True:
+            print(f"\n================ 第 {round_count} 轮开始 ================")
+            processed_in_round = 0
 
-                for keyword in config.search.keywords:
-                    # Check global limit
+            if judge and config.ai_judge.mode == "batch":
+                judged_count, failed_count = run_batch_classify_help_posts(
+                    store=store,
+                    judge=judge,
+                    table_names=config.ai_judge.tables,
+                    batch_size=config.ai_judge.batch_size,
+                    verbose=True,
+                )
+                help_judged += judged_count
+                help_judge_failed += failed_count
+                if judged_count > 0 or failed_count > 0:
+                    print(f"AI批量判定总计：成功 {judged_count} 条，失败 {failed_count} 条")
+
+            if config.ai_judge.generate_reply_mode in ("generate", "reply", "all"):
+                try:
+                    stats = run_generate_and_reply_help_comments(
+                        store=store,
+                        config=config,
+                        mode=config.ai_judge.generate_reply_mode,
+                        batch_size=config.ai_judge.batch_size,
+                        table_names=config.ai_judge.tables,
+                        reply_target_ids=config.ai_judge.reply_target_ids,
+                        overwrite_generated_comment=config.ai_judge.overwrite_generated_comment,
+                        verbose=True,
+                    )
+                    generated_success += stats.generate_success
+                    generated_failed += stats.generate_failed
+                    replied_success += stats.reply_success
+                    replied_failed += stats.reply_failed
+                except Exception as exc:
+                    failed += 1
+                    print_colored(f"[失败] 生成/回复流程异常：{exc}", COLOR_YELLOW)
+
+            for keyword in config.search.keywords:
+                if processed >= config.execution.max_count_total:
+                    should_quit = True
+                    break
+                if processed_in_round >= config.execution.max_comments_per_round:
+                    break
+
+                print(f"=== 数据库检索关键词: {keyword} ===")
+                notes = store.search_notes(keyword, limit=20)
+                candidates = processor.filter_candidates(notes)
+                print(f"检索到 {len(candidates)} 条候选记录...")
+
+                total_candidates = len(candidates)
+                for idx, note in enumerate(candidates, 1):
                     if processed >= config.execution.max_count_total:
                         should_quit = True
                         break
-                    
-                    # Check round limit
                     if processed_in_round >= config.execution.max_comments_per_round:
+                        print_colored(
+                            f"已达到本轮处理上限 ({config.execution.max_comments_per_round})，停止本轮。",
+                            COLOR_YELLOW,
+                        )
                         break
 
-                    print(f"=== 正在搜索: {keyword} ===")
+                    print(f"--- 记录 [{idx}/{total_candidates}] ---")
+
                     try:
-                        candidates, skipped_count = processor.search_candidates(keyword, limit=20)
-                    except McpError as exc:
+                        is_duplicate = store.is_duplicate_feed(note.feed_id)
+                        store.mark_note_duplicate(note.id, is_duplicate)
+                    except Exception as exc:
                         failed += 1
-                        print_colored(f"[错误] 搜索失败：{exc}", COLOR_RED)
+                        print_colored(f"[失败] 重复检测失败：{exc}", COLOR_YELLOW)
                         continue
 
-                    print(f"搜索到 {len(candidates)} 条候选笔记...")
-                    skipped += skipped_count
+                    if is_duplicate:
+                        print_colored("[跳过] 数据库标记重复记录", COLOR_YELLOW)
+                        skipped += 1
+                        continue
 
-                    total_candidates = len(candidates)
-                    for idx, candidate in enumerate(candidates, 1):
-                        if processed >= config.execution.max_count_total:
-                            should_quit = True
-                            break
-                        if processed_in_round >= config.execution.max_comments_per_round:
-                            print_colored(f"已达到本轮处理上限 ({config.execution.max_comments_per_round})，停止本轮。", COLOR_YELLOW)
-                            break
+                    if store.check_duplicate_processed(note.feed_id):
+                        print_colored("[跳过] 历史已处理", COLOR_YELLOW)
+                        skipped += 1
+                        continue
 
-                        print(f"--- 笔记 [{idx}/{total_candidates}] ---")
-                        print("检查历史记录...", end="")
-                        if store.check_duplicate(candidate.feed_id):
-                            print_colored(" [跳过]", COLOR_YELLOW)
-                            skipped += 1
-                            continue
-                        print_colored(" [通过]", COLOR_GREEN)
-
-                        print("检查 Token...", end="")
-                        if not candidate.xsec_token:
-                            print_colored(" [跳过] 无法获取 Token", COLOR_YELLOW)
-                            skipped += 1
-                            continue
-                        print_colored(" [通过]", COLOR_GREEN)
-
-                        print("正在获取详情...")
-                        try:
-                            detail = processor.fetch_detail(candidate)
-                        except McpError as exc:
-                            failed += 1
-                            print_colored(f"[失败] 获取详情失败：{exc}", COLOR_RED)
-                            print(f"等待 {config.execution.retry_interval} 秒后重试...")
-                            time.sleep(config.execution.retry_interval)  # 使用配置的重试间隔
-                            continue
-
-                        title = _clean_single_line(detail.title)
-                        preview = _truncate_text(_clean_single_line(detail.content), 50)
-                        if not preview:
-                            preview = "(无内容)"
-                        print(f"标题: {title}")
-                        print(f"预览: {preview}")
-
-                        decision = processor.prompt_comment(detail)
-                        if decision.action == ACTION_QUIT:
-                            should_quit = True
-                            break
-                        if decision.action == ACTION_SKIP:
-                            skipped += 1
-                            continue
-
-                        print("正在发送评论...", end="")
-                        try:
-                            service.post_comment(detail.feed_id, detail.xsec_token, decision.content)
-                        except Exception as exc:
-                            failed += 1
-                            print_colored(" [失败]", COLOR_RED)
-                            print_colored(f"[错误] 评论失败：{exc}", COLOR_RED)
-                            continue
-                        print_colored(" [成功]", COLOR_GREEN)
-                        processed += 1
-                        processed_in_round += 1
-
-                        is_liked = False
-                        if config.execution.auto_like:
-                            like_delay = random.uniform(1, 3)
-                            print(f"等待 {like_delay:.1f} 秒后点赞...")
-                            time.sleep(like_delay)
-                            print("正在点赞...", end="")
+                    current_is_help_post = note.is_help_post
+                    if judge and config.ai_judge.mode in ("auto", "immediate") and current_is_help_post is None:
+                        judged = judge.classify_row(note.id, note.title, note.content)
+                        if judged is None:
+                            help_judge_failed += 1
+                        else:
                             try:
-                                service.like_feed(detail.feed_id, detail.xsec_token, unlike=False)
-                                is_liked = True
-                                print_colored(" [成功]", COLOR_GREEN)
-                            except McpError as exc:
-                                print_colored(" [失败]", COLOR_YELLOW)
-                                print_colored(f"评论成功，但点赞失败，继续执行... ({exc})", COLOR_YELLOW)
+                                store.update_help_post(note.id, judged)
+                                help_judged += 1
+                                current_is_help_post = judged
+                            except Exception as exc:
+                                help_judge_failed += 1
+                                judge.log_error(note.id, f"db update failed: {exc}")
+                    if current_is_help_post != 1:
+                        print_colored("[跳过] is_help_post != 1", COLOR_YELLOW)
+                        skipped += 1
+                        continue
 
-                        record = InteractionRecord(
-                            feed_id=detail.feed_id,
-                            keyword=keyword,
-                            comment_content=decision.content,
-                            is_liked=is_liked,
-                            created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        )
-                        print("正在写入记录...", end="")
-                        store.log_action(record)
-                        print_colored(" [完成]", COLOR_GREEN)
+                    title = _clean_single_line(note.title)
+                    preview = _truncate_text(_clean_single_line(note.content), 50)
+                    if not preview:
+                        preview = "(无内容)"
+                    print(f"标题: {title}")
+                    print(f"预览: {preview}")
 
-                        interval_start, interval_end = config.execution.interval_range
-                        wait_time = random.uniform(interval_start, interval_end)
-                        print(f"等待 {wait_time:.1f} 秒...")
-                        time.sleep(wait_time)
-                    
-                    # If we broke out due to round limit
-                    if processed_in_round >= config.execution.max_comments_per_round:
+                    decision = processor.prompt_comment(note)
+                    if decision.action == ACTION_QUIT:
+                        should_quit = True
                         break
+                    if decision.action == ACTION_SKIP:
+                        skipped += 1
+                        continue
 
-                if should_quit or processed >= config.execution.max_count_total:
+                    record = InteractionRecord(
+                        note_id=note.id,
+                        feed_id=note.feed_id,
+                        keyword=keyword,
+                        comment_content=decision.content,
+                        is_liked=False,
+                        is_duplicate=0,
+                        created_at=store.now_text(),
+                    )
+
+                    print("正在写入记录...", end="")
+                    try:
+                        store.log_action(record)
+                    except Exception as exc:
+                        failed += 1
+                        print_colored(" [失败]", COLOR_YELLOW)
+                        print_colored(f"[错误] 写入失败：{exc}", COLOR_YELLOW)
+                        continue
+
+                    print_colored(" [完成]", COLOR_GREEN)
+                    processed += 1
+                    processed_in_round += 1
+
+                    interval_start, interval_end = config.execution.interval_range
+                    wait_time = random.uniform(interval_start, interval_end)
+                    print(f"等待 {wait_time:.1f} 秒...")
+                    time.sleep(wait_time)
+
+                if processed_in_round >= config.execution.max_comments_per_round:
                     break
-                
-                print(f"\n本轮结束，已处理 {processed_in_round} 条。休息 {config.execution.round_interval} 秒...")
-                time.sleep(config.execution.round_interval)
-                round_count += 1
 
-            print("================ 运行结束 ================")
-            print(f"✅ 成功评论: {processed}")
-            print(f"⏭️  跳过/重复: {skipped}")
-            print(f"❌ 失败错误: {failed}")
-            print("==========================================")
+            if should_quit or processed >= config.execution.max_count_total:
+                break
+
+            print(f"\n本轮结束，已处理 {processed_in_round} 条。休息 {config.execution.round_interval} 秒...")
+            time.sleep(config.execution.round_interval)
+            round_count += 1
+
+        print("================ 运行结束 ================")
+        print(f"成功记录: {processed}")
+        print(f"跳过/重复: {skipped}")
+        print(f"失败错误: {failed}")
+        print(f"AI判定写入: {help_judged}")
+        print(f"AI判定失败: {help_judge_failed}")
+        print(f"文案生成成功: {generated_success}")
+        print(f"文案生成失败: {generated_failed}")
+        print(f"自动回复成功: {replied_success}")
+        print(f"自动回复失败: {replied_failed}")
+        print("==========================================")
 
     return 0
 

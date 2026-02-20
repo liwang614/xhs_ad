@@ -2,7 +2,9 @@
 __pycache__/
 *.pyc
 data/cookies.json
+data/
 
 *.db
 *.log
-
+.env
+ data/

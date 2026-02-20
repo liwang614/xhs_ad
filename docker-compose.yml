@@ -1,18 +1,15 @@
 services:
-  xiaohongshu-mcp:
-    # Docker Hub 镜像（默认）
-    image: xpzouying/xiaohongshu-mcp
-    # 阿里云镜像源（国内用户推荐，拉取更快）
-    # image: crpi-hocnvtkomt7w9v8t.cn-beijing.personal.cr.aliyuncs.com/xpzouying/xiaohongshu-mcp
-    container_name: xiaohongshu-mcp
+  mysql:
+    image: mysql:8.0
+    container_name: xhs-ad-mysql
     restart: unless-stopped
-    init: true
-    tty: true
-    volumes:
-      - ./data:/app/data
-      - ./images:/app/images
     environment:
-      - ROD_BROWSER_BIN=/usr/bin/google-chrome
-      - COOKIES_PATH=/app/data/cookies.json
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: media_crawler
+      MYSQL_USER: app
+      MYSQL_PASSWORD: app
     ports:
-      - "18060:18060"
+      - "3306:3306"
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
+    volumes:
+      - ./data/mysql:/var/lib/mysql
