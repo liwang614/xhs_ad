@@ -79,9 +79,9 @@ source .venv/bin/activate
 
 # 1) 数据库连接
 export MYSQL_DB_HOST=127.0.0.1
-export MYSQL_DB_PORT=13306
+export MYSQL_DB_PORT=3306
 export MYSQL_DB_USER=root
-export MYSQL_DB_PWD=YourStrongPwd
+export MYSQL_DB_PWD=123456
 export MYSQL_DB_NAME=media_crawler
 
 # 2) 选一个 key 方式

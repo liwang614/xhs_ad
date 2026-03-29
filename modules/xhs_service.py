@@ -129,6 +129,21 @@ class XhsService:
             },
         )
 
+    def like_feed(
+        self,
+        *,
+        feed_id: str,
+        xsec_token: str,
+        tool_name: str = "like_feed",
+    ) -> Json:
+        return self.call_tool(
+            tool_name,
+            {
+                "feed_id": feed_id,
+                "xsec_token": xsec_token,
+            },
+        )
+
 
 def extract_text(resp: Json) -> List[str]:
     out: List[str] = []

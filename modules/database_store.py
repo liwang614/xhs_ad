@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import os
 import re
-from typing import List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import pymysql
 
@@ -57,6 +57,13 @@ class HelpCommentReplyRecord:
     content: str
 
 
+@dataclass(frozen=True)
+class PendingLikeRecord:
+    interaction_id: int
+    feed_id: str
+    xsec_token: str
+
+
 class DatabaseStore:
     def __init__(self) -> None:
         self._note_table = self._validate_table_name(
@@ -74,9 +81,9 @@ class DatabaseStore:
         self._db_name = os.getenv("MYSQL_DB_NAME", "media_crawler")
         self._conn = pymysql.connect(
             host=os.getenv("MYSQL_DB_HOST", "127.0.0.1"),
-            port=int(os.getenv("MYSQL_DB_PORT", "13306")),
+            port=int(os.getenv("MYSQL_DB_PORT", "3306")),
             user=os.getenv("MYSQL_DB_USER", "root"),
-            password=os.getenv("MYSQL_DB_PWD", ""),
+            password=os.getenv("MYSQL_DB_PWD", "123456"),
             database=self._db_name,
             charset="utf8mb4",
             autocommit=False,
@@ -291,6 +298,63 @@ class DatabaseStore:
             if row is None:
                 return 0
             return int(row[0])
+
+    def fetch_pending_likes(
+        self,
+        limit: int,
+        *,
+        row_ids: Optional[Sequence[int]] = None,
+    ) -> List[PendingLikeRecord]:
+        normalized_ids = self._normalize_row_ids(row_ids)
+        where_parts = [
+            "i.is_liked=0",
+            "i.feed_id IS NOT NULL",
+            "i.feed_id<>''",
+            f"""
+            NOT EXISTS (
+                SELECT 1
+                FROM `{self._interaction_table}` liked
+                WHERE liked.feed_id = i.feed_id
+                  AND liked.is_liked = 1
+            )
+            """.strip(),
+        ]
+        params: List[object] = []
+        if normalized_ids:
+            placeholders = ", ".join(["%s"] * len(normalized_ids))
+            where_parts.append(f"i.id IN ({placeholders})")
+            params.extend(normalized_ids)
+
+        sql = f"""
+        SELECT MIN(i.id) AS interaction_id, i.feed_id
+        FROM `{self._interaction_table}` i
+        WHERE {" AND ".join(where_parts)}
+        GROUP BY i.feed_id
+        ORDER BY MIN(i.id) ASC
+        LIMIT %s
+        """
+        params.append(limit)
+        with self._conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows: Sequence[Tuple[object, object]] = cur.fetchall()
+
+        feed_ids = [str(row[1]).strip() for row in rows if row[1] is not None and str(row[1]).strip()]
+        token_map = self._resolve_xsec_tokens_by_feed(feed_ids)
+
+        out: List[PendingLikeRecord] = []
+        for row in rows:
+            interaction_id = int(row[0]) if row[0] is not None else 0
+            feed_id = str(row[1]).strip() if row[1] is not None else ""
+            if interaction_id <= 0 or not feed_id:
+                continue
+            out.append(
+                PendingLikeRecord(
+                    interaction_id=interaction_id,
+                    feed_id=feed_id,
+                    xsec_token=token_map.get(feed_id, ""),
+                )
+            )
+        return out
 
     def search_notes(self, keyword: str, limit: int = 20) -> List[NoteRecord]:
         columns = self._get_table_columns(self._note_table)
@@ -566,6 +630,12 @@ class DatabaseStore:
             cur.execute(sql, (is_help_post, row_id))
         self._conn.commit()
 
+    def mark_feed_liked(self, feed_id: str, *, is_liked: bool = True) -> None:
+        sql = f"UPDATE `{self._interaction_table}` SET is_liked=%s WHERE feed_id=%s"
+        with self._conn.cursor() as cur:
+            cur.execute(sql, (1 if is_liked else 0, feed_id))
+        self._conn.commit()
+
     def is_duplicate_feed(self, feed_id: str) -> bool:
         sql = f"SELECT COUNT(*) FROM `{self._note_table}` WHERE feed_id=%s"
         with self._conn.cursor() as cur:
@@ -651,6 +721,61 @@ class DatabaseStore:
                 LIMIT 1
                 """
             cur.execute(sql_by_feed, (payload, record.feed_id))
+
+    def _resolve_xsec_tokens_by_feed(self, feed_ids: Sequence[str]) -> Dict[str, str]:
+        unique_feed_ids: List[str] = []
+        for feed_id in feed_ids:
+            text = (feed_id or "").strip()
+            if text and text not in unique_feed_ids:
+                unique_feed_ids.append(text)
+
+        token_map: Dict[str, str] = {}
+        for table_name in (self._note_comment_table, self._note_table):
+            if not unique_feed_ids:
+                break
+            table_tokens = self._fetch_xsec_tokens_from_table(table_name, unique_feed_ids)
+            for feed_id, token in table_tokens.items():
+                if token and feed_id not in token_map:
+                    token_map[feed_id] = token
+        return token_map
+
+    def _fetch_xsec_tokens_from_table(self, table_name: str, feed_ids: Sequence[str]) -> Dict[str, str]:
+        if not feed_ids:
+            return {}
+
+        with self._conn.cursor() as cur:
+            if not self._table_exists(cur, table_name):
+                return {}
+
+        columns = self._get_table_columns(table_name)
+        if "id" not in columns:
+            return {}
+
+        feed_id_col = self._pick_existing_column(columns, ("feed_id", "note_id", "target_id", "item_id"))
+        xsec_token_col = self._pick_existing_column(columns, ("xsec_token",))
+        if feed_id_col is None or xsec_token_col is None:
+            return {}
+
+        placeholders = ", ".join(["%s"] * len(feed_ids))
+        sql = f"""
+        SELECT `{feed_id_col}` AS feed_id, `{xsec_token_col}` AS xsec_token
+        FROM `{table_name}`
+        WHERE `{feed_id_col}` IN ({placeholders})
+          AND `{xsec_token_col}` IS NOT NULL
+          AND `{xsec_token_col}`<>''
+        ORDER BY id DESC
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(sql, list(feed_ids))
+            rows: Sequence[Tuple[object, object]] = cur.fetchall()
+
+        out: Dict[str, str] = {}
+        for row in rows:
+            feed_id = str(row[0]).strip() if row[0] is not None else ""
+            xsec_token = str(row[1]).strip() if row[1] is not None else ""
+            if feed_id and xsec_token and feed_id not in out:
+                out[feed_id] = xsec_token
+        return out
 
     @staticmethod
     def now_text() -> str:

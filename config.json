@@ -22,7 +22,7 @@
     "judge_model": "gemini-3-flash-preview",
     "generate_model": "gemini-3-flash-preview",
     "generate_prompt_template": "你是小红书评论助手。请基于以下内容写一条自然、礼貌、简洁的中文回复，不要输出解释。\n标题：{{title}}\n内容：{{content}}\n只输出回复文案。",
-    "generate_reply_mode": "manual",
+    "generate_reply_mode": "generate",
     "reply_target_ids": [],
     "overwrite_generated_comment": false,
     "batch_size": 50,
