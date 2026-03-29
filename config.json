@@ -1,6 +1,6 @@
 {
   "search": {
-    "keywords": ["手写笔记", "无纸化"],
+    "keywords": [],
     "sort_type": "latest",
     "filter_date": ""
   },
@@ -35,5 +35,13 @@
   "mcp": {
     "url": "http://127.0.0.1:18060/mcp",
     "reply_tool_name": "reply_comment_in_feed"
+  },
+  "analysis": {
+    "enabled": true,
+    "provider": "codexexec",
+    "command": "codex",
+    "timeout": 120,
+    "batch_size": 20,
+    "tables": ["xhs_note_comment"]
   }
 }

@@ -9,6 +9,7 @@ from modules.help_post_judge import AIHelpPostJudge, HelpPostJudgeError
 from modules.logic_processor import ACTION_QUIT, ACTION_SKIP, LogicProcessor
 from tools.classify_help_posts import run_batch_classify_help_posts
 from tools.generate_and_reply_help_comments import run_generate_and_reply_help_comments
+from tools.analyze_business_opportunities import run_batch_analysis
 
 
 def main() -> int:
@@ -57,6 +58,41 @@ def main() -> int:
         total = store.count_all_interactions()
         print(f"数据库连接成功，历史记录 {total} 条")
 
+        # --- 新默认流程：商业机会分析 ---
+        if config.analysis.enabled:
+            print("\n=== 商业机会分析模式 ===")
+            from modules.analysis_pipeline import AnalysisPipeline
+            from modules.analysis_registry import AnalysisRegistry
+            from modules.providers.codexexec_provider import CodexExecError, CodexExecProvider
+
+            registry = AnalysisRegistry()
+            try:
+                provider = CodexExecProvider(
+                    command=config.analysis.command,
+                    timeout=config.analysis.timeout,
+                )
+                registry.register(provider)
+            except CodexExecError as exc:
+                print_colored(f"[警告] codexexec 不可用，跳过分析: {exc}", COLOR_YELLOW)
+                registry = None
+
+            if registry and registry.get_default():
+                pipeline = AnalysisPipeline(registry.get_default())
+                stats = run_batch_analysis(
+                    store=store,
+                    pipeline=pipeline,
+                    table_names=config.analysis.tables,
+                    batch_size=config.analysis.batch_size,
+                    only_unanalyzed=True,
+                    verbose=True,
+                )
+                print(f"分析完成: 总计={stats.total}, 需求={stats.help_post}, "
+                      f"solution_request={stats.solution_request}, 失败={stats.failed}")
+                print("请通过 GUI 查看结果: python tools/run_gui.py")
+
+            print("=== 分析模式结束 ===\n")
+
+        # --- 旧流程（默认不触发） ---
         processor = LogicProcessor(config)
         should_quit = False
         round_count = 1

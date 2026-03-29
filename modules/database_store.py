@@ -13,6 +13,20 @@ GENERATED_COMMENT_COLUMN = "generated_comment_content"
 LEGACY_SENT_COMMENT_COLUMN = "sent_comment_content"
 NOTE_COMMENT_TABLE = "xhs_note_comment"
 
+# --- 商业机会分析新增字段 ---
+ANALYSIS_COLUMNS = {
+    "opportunity_type": "VARCHAR(50) NULL COMMENT '机会类型(solution_request/none)'",
+    "opportunity_summary": "TEXT NULL COMMENT '机会摘要'",
+    "demand_reason": "TEXT NULL COMMENT '需求判定理由'",
+    "lead_score": "INT NULL COMMENT '线索评分(0-100)'",
+    "manual_reply_suggestion": "TEXT NULL COMMENT '建议人工回复话术'",
+    "analysis_status": "VARCHAR(20) NULL COMMENT '分析状态(done/failed)'",
+    "analyzed_at": "DATETIME NULL COMMENT '分析完成时间'",
+    "follow_up_status": "VARCHAR(20) NULL DEFAULT 'pending' COMMENT '跟进状态(pending/contacted/ignored)'",
+}
+
+COMMENTER_UID_CANDIDATES = ("user_id", "uid", "author_id", "comment_user_id")
+
 
 @dataclass(frozen=True)
 class NoteRecord:
@@ -33,6 +47,26 @@ class InteractionRecord:
     is_duplicate: int
     created_at: str
     note_id: int = 0
+
+
+@dataclass(frozen=True)
+class PendingAnalysisRecord:
+    table_name: str
+    row_id: int
+    title: str
+    content: str
+    commenter_uid: str
+
+
+@dataclass
+class AnalysisResult:
+    is_help_post: int
+    opportunity_type: str
+    opportunity_summary: str
+    demand_reason: str
+    lead_score: int
+    manual_reply_suggestion: str
+    commenter_uid: str
 
 
 @dataclass(frozen=True)
@@ -74,9 +108,9 @@ class DatabaseStore:
         self._db_name = os.getenv("MYSQL_DB_NAME", "media_crawler")
         self._conn = pymysql.connect(
             host=os.getenv("MYSQL_DB_HOST", "127.0.0.1"),
-            port=int(os.getenv("MYSQL_DB_PORT", "13306")),
+            port=int(os.getenv("MYSQL_DB_PORT", "3306")),
             user=os.getenv("MYSQL_DB_USER", "root"),
-            password=os.getenv("MYSQL_DB_PWD", ""),
+            password=os.getenv("MYSQL_DB_PWD", "root"),
             database=self._db_name,
             charset="utf8mb4",
             autocommit=False,
@@ -118,6 +152,7 @@ class DatabaseStore:
                 HELP_POST_COLUMN_SQL,
             )
             self._ensure_note_comment_schema(cur)
+            self._ensure_analysis_columns(cur)
         self._conn.commit()
 
     def _ensure_column(self, cur: pymysql.cursors.Cursor, table_name: str, column_name: str, column_sql: str) -> None:
@@ -240,6 +275,134 @@ class DatabaseStore:
             if row_id not in out:
                 out.append(row_id)
         return out
+
+    def _ensure_analysis_columns(self, cur: pymysql.cursors.Cursor) -> None:
+        for table_name in (self._note_table, self._note_comment_table):
+            if not self._table_exists(cur, table_name):
+                continue
+            self._ensure_analysis_columns_for_table(cur, table_name)
+
+    def _ensure_analysis_columns_for_table(self, cur: pymysql.cursors.Cursor, table_name: str) -> None:
+        for col_name, col_sql in ANALYSIS_COLUMNS.items():
+            self._ensure_column(cur, table_name, col_name, col_sql)
+
+    def _ensure_analysis_schema(self, table_name: str) -> None:
+        with self._conn.cursor() as cur:
+            if not self._table_exists(cur, table_name):
+                return
+            self._ensure_analysis_columns_for_table(cur, table_name)
+        self._conn.commit()
+
+    def fetch_pending_analysis(
+        self,
+        limit: int,
+        *,
+        table_name: Optional[str] = None,
+        only_unanalyzed: bool = True,
+    ) -> List[PendingAnalysisRecord]:
+        note_table = self._resolve_note_table(table_name)
+        self._ensure_analysis_schema(note_table)
+        columns = self._get_table_columns(note_table)
+        if "id" not in columns:
+            raise ValueError(f"table '{note_table}' has no id column")
+
+        title_col = self._pick_existing_column(columns, ("title", "note_title"))
+        content_col = self._pick_existing_column(columns, ("desc", "content", "text", "comment", "body"))
+        uid_col = self._pick_existing_column(columns, COMMENTER_UID_CANDIDATES)
+
+        title_expr = f"`{title_col}`" if title_col else "''"
+        content_expr = f"`{content_col}`" if content_col else "''"
+        uid_expr = f"`{uid_col}`" if uid_col else "''"
+
+        where = "analysis_status IS NULL" if only_unanalyzed else "1=1"
+        sql = f"""
+        SELECT id, {title_expr}, {content_expr}, {uid_expr}
+        FROM `{note_table}`
+        WHERE {where}
+        ORDER BY id ASC
+        LIMIT %s
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(sql, (limit,))
+            rows = cur.fetchall()
+
+        out: List[PendingAnalysisRecord] = []
+        for row in rows:
+            out.append(PendingAnalysisRecord(
+                table_name=note_table,
+                row_id=int(row[0]),
+                title=str(row[1] or "").strip(),
+                content=str(row[2] or "").strip(),
+                commenter_uid=str(row[3] or "").strip(),
+            ))
+        return out
+
+    def write_analysis_result(
+        self,
+        row_id: int,
+        result: AnalysisResult,
+        *,
+        table_name: Optional[str] = None,
+    ) -> None:
+        note_table = self._resolve_note_table(table_name)
+        self._ensure_analysis_schema(note_table)
+        sql = f"""
+        UPDATE `{note_table}`
+        SET is_help_post=%s,
+            opportunity_type=%s,
+            opportunity_summary=%s,
+            demand_reason=%s,
+            lead_score=%s,
+            manual_reply_suggestion=%s,
+            analysis_status='done',
+            analyzed_at=%s
+        WHERE id=%s
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(sql, (
+                result.is_help_post,
+                result.opportunity_type,
+                result.opportunity_summary,
+                result.demand_reason,
+                result.lead_score,
+                result.manual_reply_suggestion,
+                self.now_text(),
+                row_id,
+            ))
+        self._conn.commit()
+
+    def mark_analysis_failed(
+        self,
+        row_id: int,
+        *,
+        table_name: Optional[str] = None,
+    ) -> None:
+        note_table = self._resolve_note_table(table_name)
+        self._ensure_analysis_schema(note_table)
+        sql = f"""
+        UPDATE `{note_table}`
+        SET analysis_status='failed', analyzed_at=%s
+        WHERE id=%s
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(sql, (self.now_text(), row_id))
+        self._conn.commit()
+
+    def update_follow_up_status(
+        self,
+        row_id: int,
+        status: str,
+        *,
+        table_name: Optional[str] = None,
+    ) -> None:
+        if status not in ("pending", "contacted", "ignored"):
+            raise ValueError(f"invalid follow_up_status: {status}")
+        note_table = self._resolve_note_table(table_name)
+        self._ensure_analysis_schema(note_table)
+        sql = f"UPDATE `{note_table}` SET follow_up_status=%s WHERE id=%s"
+        with self._conn.cursor() as cur:
+            cur.execute(sql, (status, row_id))
+        self._conn.commit()
 
     def ensure_help_post_column(self, table_name: Optional[str] = None) -> str:
         note_table = self._resolve_note_table(table_name)

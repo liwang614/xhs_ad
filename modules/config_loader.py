@@ -63,6 +63,13 @@ DEFAULT_AI_GENERATE_PROMPT_TEMPLATE = (
 DEFAULT_MCP_URL = "http://127.0.0.1:18060/mcp"
 DEFAULT_MCP_REPLY_TOOL_NAME = "reply_comment_in_feed"
 
+DEFAULT_ANALYSIS_ENABLED = True
+DEFAULT_ANALYSIS_PROVIDER = "codexexec"
+DEFAULT_ANALYSIS_COMMAND = "codex"
+DEFAULT_ANALYSIS_TIMEOUT = 120
+DEFAULT_ANALYSIS_BATCH_SIZE = 20
+DEFAULT_ANALYSIS_TABLES = ["xhs_note_comment"]
+
 
 def print_colored(text: str, color_code: str = COLOR_WHITE) -> None:
     print(f"{color_code}{text}{COLOR_RESET}")
@@ -117,12 +124,23 @@ class AiJudgeConfig:
 
 
 @dataclass(frozen=True)
+class AnalysisConfig:
+    enabled: bool
+    provider: str
+    command: str
+    timeout: int
+    batch_size: int
+    tables: List[str]
+
+
+@dataclass(frozen=True)
 class AppConfig:
     search: SearchConfig
     execution: ExecutionConfig
     comment_mode: CommentModeConfig
     ai_judge: AiJudgeConfig
     mcp: "McpConfig"
+    analysis: AnalysisConfig
 
 
 @dataclass(frozen=True)
@@ -144,6 +162,7 @@ def load_config(path: str = "config.json") -> AppConfig:
     comment_raw = raw.get("comment_mode") if isinstance(raw.get("comment_mode"), dict) else {}
     ai_judge_raw = raw.get("ai_judge") if isinstance(raw.get("ai_judge"), dict) else {}
     mcp_raw = raw.get("mcp") if isinstance(raw.get("mcp"), dict) else {}
+    analysis_raw = raw.get("analysis") if isinstance(raw.get("analysis"), dict) else {}
 
     keywords = _normalize_keywords(search_raw.get("keywords"))
     sort_type = _normalize_sort_type(search_raw.get("sort_type"))
@@ -219,6 +238,23 @@ def load_config(path: str = "config.json") -> AppConfig:
     mcp_url = _normalize_non_empty_str(mcp_raw.get("url"), DEFAULT_MCP_URL, "mcp.url")
     mcp_reply_tool_name = _normalize_reply_tool_name(mcp_raw.get("reply_tool_name"))
 
+    analysis_enabled = _normalize_bool(
+        analysis_raw.get("enabled"), DEFAULT_ANALYSIS_ENABLED, "analysis.enabled"
+    )
+    analysis_provider = _normalize_non_empty_str(
+        analysis_raw.get("provider"), DEFAULT_ANALYSIS_PROVIDER, "analysis.provider"
+    )
+    analysis_command = _normalize_non_empty_str(
+        analysis_raw.get("command"), DEFAULT_ANALYSIS_COMMAND, "analysis.command"
+    )
+    analysis_timeout = _normalize_positive_int(
+        analysis_raw.get("timeout"), DEFAULT_ANALYSIS_TIMEOUT, "analysis.timeout"
+    )
+    analysis_batch_size = _normalize_positive_int(
+        analysis_raw.get("batch_size"), DEFAULT_ANALYSIS_BATCH_SIZE, "analysis.batch_size"
+    )
+    analysis_tables = _normalize_ai_tables(analysis_raw.get("tables") if analysis_raw.get("tables") is not None else DEFAULT_ANALYSIS_TABLES)
+
     return AppConfig(
         search=SearchConfig(
             keywords=keywords,
@@ -254,6 +290,14 @@ def load_config(path: str = "config.json") -> AppConfig:
         mcp=McpConfig(
             url=mcp_url,
             reply_tool_name=mcp_reply_tool_name,
+        ),
+        analysis=AnalysisConfig(
+            enabled=analysis_enabled,
+            provider=analysis_provider,
+            command=analysis_command,
+            timeout=analysis_timeout,
+            batch_size=analysis_batch_size,
+            tables=analysis_tables,
         ),
     )
 
